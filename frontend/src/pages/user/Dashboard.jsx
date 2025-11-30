@@ -259,6 +259,7 @@ function Dashboard() {
   const [accessModalVisible, setAccessModalVisible] = useState(false);
   const [accessCode, setAccessCode] = useState(null);
   const lastAccessRef = useRef({ placeId: null, at: 0 });
+  const [isFollowing, setIsFollowing] = useState(true); // follow camera on position updates
   // Proximity alert state
   const [nearbyAlert, setNearbyAlert] = useState(null); // { point, distanceM }
   const lastAlertRef = useRef({ placeId: null, at: 0 });
@@ -501,9 +502,13 @@ function Dashboard() {
           try {
             if (!dirRendererRef.current) {
               dirRendererRef.current = new mapsApi.DirectionsRenderer({ suppressMarkers: true, preserveViewport: false });
+              // attach click listener on route to mark manual interaction
+              try { dirRendererRef.current.addListener && dirRendererRef.current.addListener('click', () => setIsFollowing(false)); } catch (_) {}
             }
             dirRendererRef.current.setMap(mapRef.current);
             dirRendererRef.current.setDirections(result);
+            // when a route is set, enable following by default
+            setIsFollowing(true);
           } catch (_) {}
 
           const leg = result.routes[0].legs[0];
@@ -555,6 +560,8 @@ function Dashboard() {
     const now = Date.now();
     // If the user interacted with the map recently, don't auto-follow
     if (now - lastUserInteractionRef.current < 5000) return;
+    // Respect explicit follow toggle
+    if (!isFollowing) return;
     try {
       // If following a route, try to center slightly ahead along the route
       if (directions && directions.routes && directions.routes.length) {
@@ -982,6 +989,24 @@ function Dashboard() {
               overflow: 'hidden',
             }}
           >
+            <div style={{ position: 'absolute', top: 12, right: 12, zIndex: 40 }}>
+              <button
+                type="button"
+                onClick={() => setIsFollowing((v) => !v)}
+                title={isFollowing ? 'Detener seguimiento' : 'Seguir mi ubicación'}
+                style={{
+                  padding: '0.5rem 0.65rem',
+                  borderRadius: 10,
+                  border: '1px solid rgba(148,163,184,0.18)',
+                  background: isFollowing ? 'rgba(59,130,246,0.25)' : 'rgba(15,23,42,0.6)',
+                  color: '#e2f8ff',
+                  cursor: 'pointer',
+                  fontWeight: 700,
+                }}
+              >
+                {isFollowing ? 'Siguiendo' : 'No seguir'}
+              </button>
+            </div>
             {guidance && (
               <div
                 style={{
@@ -1139,16 +1164,16 @@ function Dashboard() {
                   mapRef.current = map;
                   // attach interaction listeners so we don't fight user pans
                   try {
-                    const dragListener = map.addListener('dragstart', () => { lastUserInteractionRef.current = Date.now(); });
-                    const zoomListener = map.addListener('zoom_changed', () => { lastUserInteractionRef.current = Date.now(); });
-                    const mouseDown = map.addListener('mousedown', () => { lastUserInteractionRef.current = Date.now(); });
+                      const dragListener = map.addListener('dragstart', () => { lastUserInteractionRef.current = Date.now(); setIsFollowing(false); });
+                      const zoomListener = map.addListener('zoom_changed', () => { lastUserInteractionRef.current = Date.now(); setIsFollowing(false); });
+                      const mouseDown = map.addListener('mousedown', () => { lastUserInteractionRef.current = Date.now(); setIsFollowing(false); });
                     // store listeners for cleanup
                     map.__popi_listeners = [dragListener, zoomListener, mouseDown];
                   } catch (e) {
                     // ignore listener attach errors
                   }
 
-                  // Create a single DirectionsRenderer instance and attach to the map
+                      // Create a single DirectionsRenderer instance and attach to the map
                   try {
                     const mapsApi = window.google?.maps;
                     if (mapsApi) {

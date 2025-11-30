@@ -6,7 +6,6 @@ import {
   GoogleMap,
   Marker,
   Circle,
-  DirectionsRenderer,
   useLoadScript,
 } from '@react-google-maps/api';
 
@@ -477,22 +476,17 @@ function Dashboard() {
   useEffect(() => {
     if (!position || !selectedPoint || !isLoaded) {
       try { dirRendererRef.current?.setMap(null); } catch (_) {}
-      dirRendererRef.current = null;
       setDirections(null);
       setRouteInfo(null);
       setGuidance(null);
       return;
     }
 
-  const mapsApi = typeof window !== 'undefined' ? window.google?.maps : null;
-    if (!mapsApi) return;
+    const mapsApi = typeof window !== 'undefined' ? window.google?.maps : null;
+    if (!mapsApi || !mapRef.current) return;
 
-  // Detach any existing renderer before requesting a new route
-  try { dirRendererRef.current?.setMap(null); } catch (_) {}
-  dirRendererRef.current = null;
-  setDirections(null);
-
-  const service = new mapsApi.DirectionsService();
+    // Ask directions service for route
+    const service = new mapsApi.DirectionsService();
     service.route(
       {
         origin: position,
@@ -502,6 +496,16 @@ function Dashboard() {
       (result, status) => {
         if (status === 'OK' && result?.routes?.length) {
           setDirections(result);
+
+          // Ensure we have a renderer instance, reuse if present
+          try {
+            if (!dirRendererRef.current) {
+              dirRendererRef.current = new mapsApi.DirectionsRenderer({ suppressMarkers: true, preserveViewport: false });
+            }
+            dirRendererRef.current.setMap(mapRef.current);
+            dirRendererRef.current.setDirections(result);
+          } catch (_) {}
+
           const leg = result.routes[0].legs[0];
           if (leg) {
             setRouteInfo({
@@ -526,9 +530,16 @@ function Dashboard() {
             setRouteInfo(null);
             setGuidance(null);
           }
+
+          // Fit map to route bounds for initial route display
+          try {
+            const bounds = result.routes[0].bounds;
+            if (bounds && mapRef.current && typeof mapRef.current.fitBounds === 'function') {
+              mapRef.current.fitBounds(bounds);
+            }
+          } catch (_) {}
         } else {
           try { dirRendererRef.current?.setMap(null); } catch (_) {}
-          dirRendererRef.current = null;
           setDirections(null);
           setRouteInfo(null);
           setGuidance(null);
@@ -544,8 +555,50 @@ function Dashboard() {
     const now = Date.now();
     // If the user interacted with the map recently, don't auto-follow
     if (now - lastUserInteractionRef.current < 5000) return;
-
     try {
+      // If following a route, try to center slightly ahead along the route
+      if (directions && directions.routes && directions.routes.length) {
+        try {
+          const route = directions.routes[0];
+          const leg = route.legs && route.legs[0];
+          const steps = leg && Array.isArray(leg.steps) ? leg.steps : [];
+          if (steps.length) {
+            // find nearest step index
+            let bestIdx = 0;
+            let bestDist = Infinity;
+            for (let i = 0; i < steps.length; i++) {
+              const s = steps[i];
+              if (Array.isArray(s.path) && s.path.length) {
+                for (const p of s.path) {
+                  const d = computeDistanceM(position, { lat: p.lat(), lng: p.lng() });
+                  if (d < bestDist) { bestDist = d; bestIdx = i; }
+                }
+              } else if (s.start_location && s.end_location) {
+                const d1 = computeDistanceM(position, { lat: s.start_location.lat(), lng: s.start_location.lng() });
+                const d2 = computeDistanceM(position, { lat: s.end_location.lat(), lng: s.end_location.lng() });
+                const d = Math.min(d1, d2);
+                if (d < bestDist) { bestDist = d; bestIdx = i; }
+              }
+            }
+            const next = steps[Math.min(bestIdx + 1, steps.length - 1)];
+            if (next && next.end_location) {
+              const nextLat = next.end_location.lat();
+              const nextLng = next.end_location.lng();
+              const centerLat = position.lat + 0.4 * (nextLat - position.lat);
+              const centerLng = position.lng + 0.4 * (nextLng - position.lng);
+              mapRef.current.panTo({ lat: centerLat, lng: centerLng });
+              try {
+                const targetZoom = isMobile ? 15 : 16;
+                if (mapRef.current.getZoom() < targetZoom) mapRef.current.setZoom(targetZoom);
+              } catch (_) {}
+              return;
+            }
+          }
+        } catch (_) {
+          // fallback to simple pan
+        }
+      }
+
       const center = mapRef.current.getCenter();
       if (!center) {
         mapRef.current.panTo(position);
@@ -1094,6 +1147,22 @@ function Dashboard() {
                   } catch (e) {
                     // ignore listener attach errors
                   }
+
+                  // Create a single DirectionsRenderer instance and attach to the map
+                  try {
+                    const mapsApi = window.google?.maps;
+                    if (mapsApi) {
+                      // ensure previous instance removed
+                      try { dirRendererRef.current?.setMap(null); } catch (_) {}
+                      dirRendererRef.current = new mapsApi.DirectionsRenderer({
+                        suppressMarkers: true,
+                        preserveViewport: false,
+                      });
+                      dirRendererRef.current.setMap(map);
+                    }
+                  } catch (_) {
+                    // ignore
+                  }
                 }}
                 onUnmount={() => {
                   try {
@@ -1103,6 +1172,8 @@ function Dashboard() {
                       }
                     }
                   } catch (_) {}
+                  try { dirRendererRef.current?.setMap(null); } catch (_) {}
+                  dirRendererRef.current = null;
                   mapRef.current = null;
                 }}
               >
@@ -1142,15 +1213,7 @@ function Dashboard() {
                   );
                 })}
 
-                {directions && (
-                  <DirectionsRenderer
-                    key={selectedPoint ? `route-${selectedPoint.id}` : 'route'}
-                    directions={directions}
-                    options={{ suppressMarkers: true, preserveViewport: false }}
-                    onLoad={(dr) => { dirRendererRef.current = dr; }}
-                    onUnmount={() => { dirRendererRef.current = null; }}
-                  />
-                )}
+                {/* DirectionsRenderer is managed manually (single instance) via map onLoad and effects */}
               </GoogleMap>
             )}
           </div>

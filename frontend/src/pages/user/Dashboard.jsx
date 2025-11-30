@@ -440,24 +440,27 @@ function Dashboard() {
   const [places, setPlaces] = useState([]);
   const [placesLoading, setPlacesLoading] = useState(false);
   const [placesError, setPlacesError] = useState('');
+  // Helper to load places for a given origin (reusable on map load and position changes)
+  const fetchPlacesFor = async (origin) => {
+    if (!origin) return;
+    setPlacesLoading(true);
+    setPlacesError('');
+    try {
+      const data = await fetchPublicPlaces({ lat: origin.lat, lng: origin.lng, radius_km: radiusMeters / 1000 });
+      setPlaces(Array.isArray(data?.places) ? data.places : []);
+    } catch (err) {
+      setPlacesError(err.message || 'No pudimos cargar los lugares.');
+      setPlaces([]);
+    } finally {
+      setPlacesLoading(false);
+    }
+  };
 
-  // Fetch places from server when we have a position (or default center) and radius
+  // Fetch places when position or radius changes
   useEffect(() => {
     const origin = position || defaultCenter;
-    const load = async () => {
-      setPlacesLoading(true);
-      setPlacesError('');
-      try {
-        const data = await fetchPublicPlaces({ lat: origin.lat, lng: origin.lng, radius_km: radiusMeters / 1000 });
-        setPlaces(Array.isArray(data?.places) ? data.places : []);
-      } catch (err) {
-        setPlacesError(err.message || 'No pudimos cargar los lugares.');
-        setPlaces([]);
-      } finally {
-        setPlacesLoading(false);
-      }
-    };
-    load();
+    fetchPlacesFor(origin);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [position, radiusMeters]);
 
   const filteredPoints = useMemo(() => {
@@ -1183,7 +1186,17 @@ function Dashboard() {
                         suppressMarkers: true,
                         preserveViewport: false,
                       });
-                      dirRendererRef.current.setMap(map);
+                            dirRendererRef.current.setMap(map);
+                            // If we have a restored user position, center the map there
+                            try {
+                              if (position) {
+                                map.panTo(position);
+                                const targetZoom = isMobile ? 15 : 16;
+                                try { if (map.getZoom() < targetZoom) map.setZoom(targetZoom); } catch (_) {}
+                              }
+                            } catch (_) {}
+                            // Trigger a fresh load of places for the current position so markers appear reliably
+                            try { fetchPlacesFor(position || defaultCenter); } catch (_) {}
                     }
                   } catch (_) {
                     // ignore

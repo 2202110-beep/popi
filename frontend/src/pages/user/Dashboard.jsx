@@ -256,6 +256,10 @@ function Dashboard() {
   const dirRendererRef = useRef(null);
   const mapRef = useRef(null);
   const lastUserInteractionRef = useRef(0);
+  // Access code modal state + tracking
+  const [accessModalVisible, setAccessModalVisible] = useState(false);
+  const [accessCode, setAccessCode] = useState(null);
+  const lastAccessRef = useRef({ placeId: null, at: 0 });
   // Proximity alert state
   const [nearbyAlert, setNearbyAlert] = useState(null); // { point, distanceM }
   const lastAlertRef = useRef({ placeId: null, at: 0 });
@@ -654,6 +658,31 @@ function Dashboard() {
     }
   }, [position, filteredPoints]);
 
+  // Show access-code modal when user is very close to the selectedPoint
+  useEffect(() => {
+    if (!position || !selectedPoint) return;
+    try {
+      const distM = computeDistanceM(position, { lat: selectedPoint.lat, lng: selectedPoint.lng });
+      const ACCESS_THRESHOLD_M = 25; // threshold to show the code
+      const now = Date.now();
+      const cooldownMs = 5 * 60 * 1000; // don't re-show for 5 minutes for same place
+      const wasRecentlyShown = lastAccessRef.current.placeId === selectedPoint.id && (now - lastAccessRef.current.at) < cooldownMs;
+      if (distM <= ACCESS_THRESHOLD_M && !wasRecentlyShown) {
+        // generate a simple temporary code (6 digits)
+        const code = String(Math.floor(100000 + Math.random() * 900000));
+        setAccessCode(code);
+        setAccessModalVisible(true);
+        lastAccessRef.current = { placeId: selectedPoint.id, at: now };
+      }
+      if (distM > ACCESS_THRESHOLD_M + 10) {
+        // hide when moving away
+        setAccessModalVisible(false);
+      }
+    } catch (_e) {
+      // ignore
+    }
+  }, [position, selectedPoint]);
+
   const handleRadiusChange = (event) => setRadiusMeters(Number(event.target.value));
   const handleRecenter = () => {
     if (!('geolocation' in navigator)) return;
@@ -987,6 +1016,56 @@ function Dashboard() {
                 >
                   Cerrar
                 </button>
+              </div>
+            )}
+            {accessModalVisible && selectedPoint && (
+              <div
+                role="dialog"
+                aria-modal="true"
+                style={{
+                  position: 'absolute',
+                  bottom: 24,
+                  left: '50%',
+                  transform: 'translateX(-50%)',
+                  zIndex: 6,
+                  background: 'linear-gradient(180deg, rgba(8,47,73,0.98), rgba(2,6,23,0.95))',
+                  border: '1px solid rgba(59,130,246,0.45)',
+                  color: '#ecfeff',
+                  padding: '0.85rem 1rem',
+                  borderRadius: 12,
+                  boxShadow: '0 18px 40px -20px rgba(2,132,199,0.45)',
+                  maxWidth: 520,
+                  width: 'calc(100% - 2rem)',
+                }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: '0.75rem', alignItems: 'center' }}>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                    <strong style={{ color: '#bfdbfe' }}>Estás por llegar</strong>
+                    <span style={{ color: '#c7f9ff' }}>Por favor entrega este código al negocio para obtener acceso:</span>
+                    <div style={{ fontSize: '1.25rem', fontWeight: 800, color: '#93c5fd' }}>{accessCode}</div>
+                    <div style={{ fontSize: '0.9rem', color: '#94a3b8' }}>{selectedPoint.business_name}</div>
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        try {
+                          await navigator.clipboard.writeText(accessCode || '');
+                        } catch (_) {}
+                      }}
+                      style={{ padding: '0.5rem 0.75rem', borderRadius: 10, border: '1px solid rgba(148,163,184,0.18)', background: 'rgba(59,130,246,0.18)', color: '#e2f8ff', cursor: 'pointer' }}
+                    >
+                      Copiar código
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAccessModalVisible(false)}
+                      style={{ padding: '0.45rem 0.7rem', borderRadius: 10, border: '1px solid rgba(148,163,184,0.18)', background: 'rgba(15,23,42,0.35)', color: '#e2e8f0', cursor: 'pointer' }}
+                    >
+                      Cerrar
+                    </button>
+                  </div>
+                </div>
               </div>
             )}
             {loadError && (

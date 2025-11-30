@@ -254,6 +254,8 @@ function Dashboard() {
   const [travelMode, setTravelMode] = useState('WALKING');
   const [guidance, setGuidance] = useState(null); // { text, subText, distanceM, etaMin }
   const dirRendererRef = useRef(null);
+  const mapRef = useRef(null);
+  const lastUserInteractionRef = useRef(0);
   // Proximity alert state
   const [nearbyAlert, setNearbyAlert] = useState(null); // { point, distanceM }
   const lastAlertRef = useRef({ placeId: null, at: 0 });
@@ -531,6 +533,35 @@ function Dashboard() {
       },
     );
   }, [position, selectedPoint, travelMode, isLoaded]);
+
+  // Auto-follow behavior: pan the map to the user's current position
+  useEffect(() => {
+    if (!position || !isLoaded || !mapRef.current) return;
+    const now = Date.now();
+    // If the user interacted with the map recently, don't auto-follow
+    if (now - lastUserInteractionRef.current < 5000) return;
+
+    try {
+      const center = mapRef.current.getCenter();
+      if (!center) {
+        mapRef.current.panTo(position);
+        return;
+      }
+      const centerPos = { lat: center.lat(), lng: center.lng() };
+      const distM = computeDistanceM(centerPos, position);
+      // Only recenter when the user has moved noticeably (avoid tiny pans)
+      if (distM > 30) {
+        mapRef.current.panTo(position);
+        // keep sensible zoom when following user
+        try {
+          const targetZoom = isMobile ? 15 : 16;
+          if (mapRef.current.getZoom() < targetZoom) mapRef.current.setZoom(targetZoom);
+        } catch (_) {}
+      }
+    } catch (_) {
+      // ignore map pan errors
+    }
+  }, [position, isLoaded, isMobile]);
 
   // Live guidance update based on current position vs route steps
   useEffect(() => {
@@ -972,6 +1003,29 @@ function Dashboard() {
                 zoom={position ? (isMobile ? 15 : 16) : 12}
                 center={position || defaultCenter}
                 options={mapOptions}
+                onLoad={(map) => {
+                  mapRef.current = map;
+                  // attach interaction listeners so we don't fight user pans
+                  try {
+                    const dragListener = map.addListener('dragstart', () => { lastUserInteractionRef.current = Date.now(); });
+                    const zoomListener = map.addListener('zoom_changed', () => { lastUserInteractionRef.current = Date.now(); });
+                    const mouseDown = map.addListener('mousedown', () => { lastUserInteractionRef.current = Date.now(); });
+                    // store listeners for cleanup
+                    map.__popi_listeners = [dragListener, zoomListener, mouseDown];
+                  } catch (e) {
+                    // ignore listener attach errors
+                  }
+                }}
+                onUnmount={() => {
+                  try {
+                    if (mapRef.current && mapRef.current.__popi_listeners) {
+                      for (const l of mapRef.current.__popi_listeners) {
+                        try { l.remove(); } catch (_) {}
+                      }
+                    }
+                  } catch (_) {}
+                  mapRef.current = null;
+                }}
               >
                 {position && (
                   <>

@@ -447,7 +447,18 @@ function Dashboard() {
     setPlacesError('');
     try {
       const data = await fetchPublicPlaces({ lat: origin.lat, lng: origin.lng, radius_km: radiusMeters / 1000 });
-      setPlaces(Array.isArray(data?.places) ? data.places : []);
+      const fetched = Array.isArray(data?.places) ? data.places : [];
+      // If user has a stored selectedPoint, ensure it's present in the places list
+      try {
+        const raw = localStorage.getItem('popi_selected_point');
+        if (raw) {
+          const stored = JSON.parse(raw);
+          if (stored && stored.id && !fetched.some((p) => p.id === stored.id)) {
+            fetched.unshift(stored);
+          }
+        }
+      } catch (_) {}
+      setPlaces(fetched);
     } catch (err) {
       setPlacesError(err.message || 'No pudimos cargar los lugares.');
       setPlaces([]);
@@ -469,11 +480,8 @@ function Dashboard() {
 
   useEffect(() => {
     if (selectedPoint && !filteredPoints.some((point) => point.id === selectedPoint.id)) {
-      setSelectedPoint(null);
-      try { dirRendererRef.current?.setMap(null); } catch (_) {}
-      dirRendererRef.current = null;
-      setDirections(null);
-      setRouteInfo(null);
+      // If the selected point is no longer in the current filtered list, clear selection
+      clearSelectedPoint();
     }
   }, [filteredPoints, selectedPoint]);
 
@@ -714,7 +722,7 @@ function Dashboard() {
       setNearbyAlert({ point: nearest, distanceM: Math.round(nearestDistM) });
       lastAlertRef.current = { placeId: nearest.id, at: now };
       // Optionally auto-select the point for quick actions
-      setSelectedPoint((prev) => prev ?? nearest);
+      if (!selectedPoint) handleSelectPoint(nearest);
     } else if (nearestDistM > PROXIMITY_M + 10) {
       // Hide alert when moving away with hysteresis
       setNearbyAlert(null);
@@ -746,6 +754,19 @@ function Dashboard() {
     }
   }, [position, selectedPoint]);
 
+  // Persist/restore selectedPoint to survive reloads
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem('popi_selected_point');
+      if (raw) {
+        const stored = JSON.parse(raw);
+        if (stored && typeof stored.id !== 'undefined') {
+          setSelectedPoint(stored);
+        }
+      }
+    } catch (_) {}
+  }, []);
+
   const handleRadiusChange = (event) => setRadiusMeters(Number(event.target.value));
   const handleRecenter = () => {
     if (!('geolocation' in navigator)) return;
@@ -761,6 +782,23 @@ function Dashboard() {
       () => setError('No pudimos recentrar tu ubicacion.'),
       { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
     );
+  };
+
+  // Centralized selection handler that persists the selected point
+  const handleSelectPoint = (point) => {
+    setSelectedPoint(point);
+    try {
+      localStorage.setItem('popi_selected_point', JSON.stringify(point));
+    } catch (_) {}
+  };
+
+  const clearSelectedPoint = () => {
+    setSelectedPoint(null);
+    try { localStorage.removeItem('popi_selected_point'); } catch (_) {}
+    try { dirRendererRef.current?.setMap(null); } catch (_) {}
+    setDirections(null);
+    setRouteInfo(null);
+    setGuidance(null);
   };
 
   const mapContainerResponsiveStyle = {
@@ -1240,7 +1278,7 @@ function Dashboard() {
                     <Marker
                       key={point.id}
                       position={{ lat: point.lat, lng: point.lng }}
-                      onClick={() => setSelectedPoint(point)}
+                      onClick={() => handleSelectPoint(point)}
                       icon={{
                         url: isSelected
                           ? 'https://maps.gstatic.com/mapfiles/ms2/micons/toilets.png'
@@ -1256,7 +1294,7 @@ function Dashboard() {
             )}
           </div>
 
-          <div style={resultsListStyle}>
+                <div style={resultsListStyle}>
             {filteredPoints.map((point) => {
               const isSelected = selectedPoint?.id === point.id;
               const distanceKm = point.distance_km ?? (position ? computeDistanceKm(position.lat, position.lng, point.lat, point.lng) : null);
@@ -1268,7 +1306,7 @@ function Dashboard() {
                     border: isSelected ? '1px solid rgba(56,189,248,0.65)' : resultCardStyle.border,
                     cursor: 'pointer',
                   }}
-                  onClick={() => setSelectedPoint(point)}
+                  onClick={() => handleSelectPoint(point)}
                 >
                   <strong style={{ color: '#38bdf8', fontSize: '1rem' }}>{point.business_name}</strong>
                   <span style={{ fontSize: '0.85rem', color: '#cbd5f5' }}>

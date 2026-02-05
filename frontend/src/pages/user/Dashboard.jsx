@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { logoutUser } from '../../api/auth.js';
-import { fetchPublicPlaces } from '../../api/places.js';
+import { logoutUser, request } from '../../api/auth.js';
+import { fetchPublicPlaces, fetchPublicPlaceById } from '../../api/places.js';
 import {
   GoogleMap,
   Marker,
@@ -17,7 +17,7 @@ const mapContainerStyle = {
   height: '100%',
   borderRadius: '24px',
   overflow: 'hidden',
-  boxShadow: '0 30px 70px -35px rgba(14,165,233,0.45)',
+  boxShadow: '0 30px 70px -35px rgba(vb14,165,233,0.45)',
 };
 
 const mapOptions = {
@@ -315,58 +315,89 @@ function Dashboard() {
       );
     }
   }, []);
+  const REQUIRED_ACCURACY_M = 40; // require reasonably accurate fix
+  const DWELL_MS = 4000; // require 4 seconds inside the threshold
 
   useEffect(() => {
     if (!('geolocation' in navigator)) {
-      setError('Tu navegador no soporta geolocalizacion.');
-      return;
+      setError('Geolocalización no disponible en este navegador.');
+      return undefined;
     }
 
-    const watcher = navigator.geolocation.watchPosition(
-      (pos) => {
-        const { latitude, longitude, heading: hd, speed: spd, accuracy: acc } = pos.coords;
+    const ACCESS_THRESHOLD_M = 25; // proximity threshold for access issuance
+    let watcher = null;
+
+    watcher = navigator.geolocation.watchPosition(
+      async (pos) => {
+        const { latitude, longitude, accuracy: acc, heading: hd, speed: spd } = pos.coords;
         const newPos = { lat: latitude, lng: longitude };
+        const accMeters = typeof acc === 'number' ? Math.round(acc) : null;
 
-        if (typeof acc === 'number') setAccuracy(Math.round(acc));
-
-        // Filter out unrealistic jumps when accuracy is poor
-        const last = lastAcceptedPosRef.current;
-        const distFromLastKm = last ? computeDistanceKm(last.lat, last.lng, newPos.lat, newPos.lng) : 0;
-        const accMeters = typeof acc === 'number' ? acc : null;
-        const poorAccThreshold = 80; // stricter threshold by default
-        // If accuracy is very poor and the jump is big, ignore this update
-        if (accMeters != null && accMeters > poorAccThreshold && distFromLastKm > 1.0) {
-          setError('Precisión baja, esperando mejor señal…');
-          return;
-        }
         // Ignore absurd jumps regardless of accuracy (likely a glitch)
-        if (distFromLastKm > 10) {
-          return;
-        }
+        const lastPos = lastAcceptedPosRef.current;
+        const distFromLastKm = lastPos ? computeDistanceKm(lastPos.lat, lastPos.lng, latitude, longitude) : 0;
+        if (distFromLastKm > 10) return;
+
         // Smoothing: keep last 5 samples and compute weighted average by 1/acc^2
         const buf = posBufferRef.current.slice(-4);
         buf.push({ lat: latitude, lng: longitude, acc: accMeters ?? 50 });
         posBufferRef.current = buf;
-        const weighted = (() => {
-          if (!buf.length) return newPos;
-          let sumW = 0, sx = 0, sy = 0;
-          for (const s of buf) {
-            const a = Math.max(5, Math.min(200, Number.isFinite(s.acc) ? s.acc : 50));
-            const w = 1 / (a * a); // higher weight for better accuracy
-            sumW += w; sx += s.lat * w; sy += s.lng * w;
-          }
-          if (sumW === 0) return newPos;
-          return { lat: sx / sumW, lng: sy / sumW };
-        })();
+        let sumW = 0, sx = 0, sy = 0;
+        for (const s of buf) {
+          const a = Math.max(5, Math.min(200, Number.isFinite(s.acc) ? s.acc : 50));
+          const w = 1 / (a * a);
+          sumW += w; sx += s.lat * w; sy += s.lng * w;
+        }
+        const weighted = sumW ? { lat: sx / sumW, lng: sy / sumW } : newPos;
 
         setPosition(weighted);
         lastAcceptedPosRef.current = weighted;
-        setHeading(hd ?? null);
+        if (typeof accMeters === 'number') setAccuracy(accMeters);
+        setHeading(typeof hd === 'number' ? hd : null);
         setSpeed(spd != null ? (spd * 3.6).toFixed(1) : null);
         setError('');
+
+        // Dwell and proximity check for access code issuance
+        try {
+          if (selectedPoint) {
+            const distM = computeDistanceM(weighted, { lat: selectedPoint.lat, lng: selectedPoint.lng });
+            const now = Date.now();
+            const cooldownMs = 5 * 60 * 1000; // 5 min per place
+            const wasRecentlyShown = lastAccessRef.current.placeId === selectedPoint.id && (now - lastAccessRef.current.at) < cooldownMs;
+            if (
+              distM <= ACCESS_THRESHOLD_M &&
+              !wasRecentlyShown &&
+              (accuracy == null || (typeof accMeters === 'number' && accMeters <= REQUIRED_ACCURACY_M))
+            ) {
+              // simple dwell: wait DWELL_MS before issuing (do nothing if user moves away)
+              await new Promise((r) => setTimeout(r, DWELL_MS));
+              const latestPos = lastAcceptedPosRef.current;
+              if (!latestPos) return;
+              const latestDist = computeDistanceM(latestPos, { lat: selectedPoint.lat, lng: selectedPoint.lng });
+              if (latestDist <= ACCESS_THRESHOLD_M) {
+                try {
+                  const payload = { application_id: selectedPoint.id, guest: true };
+                  if (currentUser && currentUser.id) payload.user_id = currentUser.id;
+                  const res = await request('/api/auth/codes/issue/', { method: 'POST', body: payload });
+                  const code = res?.code ?? String(Math.floor(100000 + Math.random() * 900000));
+                  setAccessCode(code);
+                  setAccessModalVisible(true);
+                  lastAccessRef.current = { placeId: selectedPoint.id, at: Date.now(), issued: res };
+                } catch (e) {
+                  const code = String(Math.floor(100000 + Math.random() * 900000));
+                  setAccessCode(code);
+                  setAccessModalVisible(true);
+                  lastAccessRef.current = { placeId: selectedPoint.id, at: Date.now() };
+                }
+              }
+            }
+          }
+        } catch (_) {
+          // ignore dwell errors
+        }
       },
       (err) => {
-        if (err.code === err.PERMISSION_DENIED) {
+        if (err && err.code === err.PERMISSION_DENIED) {
           setError('Necesitamos permiso para acceder a tu ubicacion.');
         } else {
           setError('No pudimos obtener tu ubicacion. Intenta nuevamente.');
@@ -379,8 +410,11 @@ function Dashboard() {
       },
     );
 
-    return () => navigator.geolocation.clearWatch(watcher);
-  }, []);
+    return () => {
+      try { navigator.geolocation.clearWatch(watcher); } catch (_) {}
+    };
+  // re-evaluate when selectedPoint or currentUser changes
+  }, [selectedPoint, currentUser, accuracy]);
 
   // Persist last known position for instant restore after reload
   useEffect(() => {
@@ -448,16 +482,6 @@ function Dashboard() {
     try {
       const data = await fetchPublicPlaces({ lat: origin.lat, lng: origin.lng, radius_km: radiusMeters / 1000 });
       const fetched = Array.isArray(data?.places) ? data.places : [];
-      // If user has a stored selectedPoint, ensure it's present in the places list
-      try {
-        const raw = localStorage.getItem('popi_selected_point');
-        if (raw) {
-          const stored = JSON.parse(raw);
-          if (stored && stored.id && !fetched.some((p) => p.id === stored.id)) {
-            fetched.unshift(stored);
-          }
-        }
-      } catch (_) {}
       setPlaces(fetched);
     } catch (err) {
       setPlacesError(err.message || 'No pudimos cargar los lugares.');
@@ -739,11 +763,25 @@ function Dashboard() {
       const cooldownMs = 5 * 60 * 1000; // don't re-show for 5 minutes for same place
       const wasRecentlyShown = lastAccessRef.current.placeId === selectedPoint.id && (now - lastAccessRef.current.at) < cooldownMs;
       if (distM <= ACCESS_THRESHOLD_M && !wasRecentlyShown) {
-        // generate a simple temporary code (6 digits)
-        const code = String(Math.floor(100000 + Math.random() * 900000));
-        setAccessCode(code);
-        setAccessModalVisible(true);
-        lastAccessRef.current = { placeId: selectedPoint.id, at: now };
+        // Request a server-issued access code (guest issuance). If it fails, fall back to a client-side code.
+        (async () => {
+          try {
+            const payload = { application_id: selectedPoint.id, guest: true };
+            if (currentUser && currentUser.id) payload.user_id = currentUser.id;
+            const res = await request('/api/auth/codes/issue/', { method: 'POST', body: payload });
+            // server returns structured payload with 'code' and 'text' (JSON). Show the short code visually
+            const code = res?.code ?? String(Math.floor(100000 + Math.random() * 900000));
+            setAccessCode(code);
+            setAccessModalVisible(true);
+            lastAccessRef.current = { placeId: selectedPoint.id, at: now, issued: res };
+          } catch (e) {
+            // fallback: generate client-side code
+            const code = String(Math.floor(100000 + Math.random() * 900000));
+            setAccessCode(code);
+            setAccessModalVisible(true);
+            lastAccessRef.current = { placeId: selectedPoint.id, at: now };
+          }
+        })();
       }
       if (distM > ACCESS_THRESHOLD_M + 10) {
         // hide when moving away
@@ -754,17 +792,22 @@ function Dashboard() {
     }
   }, [position, selectedPoint]);
 
-  // Persist/restore selectedPoint to survive reloads
+  // Persist selectedPoint id and restore full object by fetching from server on mount
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem('popi_selected_point');
-      if (raw) {
-        const stored = JSON.parse(raw);
-        if (stored && typeof stored.id !== 'undefined') {
-          setSelectedPoint(stored);
-        }
+    const restore = async () => {
+      try {
+        const rawId = localStorage.getItem('popi_selected_point_id');
+        if (!rawId) return;
+        const id = Number(rawId);
+        if (!Number.isFinite(id)) return;
+        const res = await fetchPublicPlaceById(id);
+        const place = res?.place ?? null;
+        if (place) setSelectedPoint(place);
+      } catch (e) {
+        // ignore restore errors
       }
-    } catch (_) {}
+    };
+    restore();
   }, []);
 
   const handleRadiusChange = (event) => setRadiusMeters(Number(event.target.value));
@@ -788,13 +831,13 @@ function Dashboard() {
   const handleSelectPoint = (point) => {
     setSelectedPoint(point);
     try {
-      localStorage.setItem('popi_selected_point', JSON.stringify(point));
+      localStorage.setItem('popi_selected_point_id', String(point.id));
     } catch (_) {}
   };
 
   const clearSelectedPoint = () => {
     setSelectedPoint(null);
-    try { localStorage.removeItem('popi_selected_point'); } catch (_) {}
+    try { localStorage.removeItem('popi_selected_point_id'); } catch (_) {}
     try { dirRendererRef.current?.setMap(null); } catch (_) {}
     setDirections(null);
     setRouteInfo(null);
@@ -906,6 +949,11 @@ function Dashboard() {
           {currentUser?.role === 'collaborator' && (
             <button type="button" style={navButtonStyle} onClick={() => navigate('/colaborador/panel')}>
               Panel colaborador
+            </button>
+          )}
+          {currentUser?.role === 'collaborator' && (
+            <button type="button" style={navButtonStyle} onClick={() => navigate('/colaborar/access')}>
+              Control de acceso
             </button>
           )}
           {currentUser?.is_staff && (
@@ -1185,6 +1233,15 @@ function Dashboard() {
                     </button>
                   </div>
                 </div>
+                {lastAccessRef.current?.issued?.text && (
+                  <div style={{ marginTop: '0.8rem', display: 'flex', justifyContent: 'center' }}>
+                    <img
+                      src={`https://quickchart.io/qr?text=${encodeURIComponent(lastAccessRef.current.issued.text)}&size=220`}
+                      alt="QR de acceso"
+                      style={{ width: 140, height: 140, borderRadius: 8 }}
+                    />
+                  </div>
+                )}
               </div>
             )}
             {loadError && (

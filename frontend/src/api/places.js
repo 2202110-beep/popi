@@ -9,3 +9,9 @@ export function fetchPublicPlaces(params = {}) {
   const path = `/api/auth/places/public/${qs ? `?${qs}` : ''}`;
   return request(path, { method: 'GET' });
 }
+
+export function fetchPublicPlaceById(id) {
+  if (typeof id === 'undefined' || id === null) return Promise.reject(new Error('Missing id'));
+  const path = `/api/auth/places/public/${encodeURIComponent(String(id))}/`;
+  return request(path, { method: 'GET' });
+}

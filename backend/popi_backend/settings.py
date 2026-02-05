@@ -130,6 +130,9 @@ CORS_ALLOWED_ORIGINS = [
     'http://192.168.1.125:5173',
     'https://192.168.1.214:5173',
     'http://192.168.1.214:5173',
+    # Common local dev host seen on some setups
+    'https://172.16.33.221:5173',
+    'http://172.16.33.221:5173',
 ]
 CORS_ALLOW_CREDENTIALS = True
 
@@ -147,7 +150,19 @@ CSRF_TRUSTED_ORIGINS = [
     'http://192.168.1.125:5173',
     'https://192.168.1.214:5173',
     'http://192.168.1.214:5173',
+    # Allow this dev host when using Vite with a LAN IP (added for convenience)
+    'https://172.16.33.221:5173',
+    'http://172.16.33.221:5173',
 ]
+
+# Allow adding extra origins via environment variable (comma-separated) for flexible dev setups
+_extra = env('EXTRA_CORS_ORIGINS', default='').strip()
+if _extra:
+    for o in [x.strip() for x in _extra.split(',') if x.strip()]:
+        if o not in CORS_ALLOWED_ORIGINS:
+            CORS_ALLOWED_ORIGINS.append(o)
+        if o not in CSRF_TRUSTED_ORIGINS:
+            CSRF_TRUSTED_ORIGINS.append(o)
 
 REST_FRAMEWORK = {
     'DEFAULT_RENDERER_CLASSES': [

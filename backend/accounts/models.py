@@ -65,3 +65,28 @@ class Bathroom(models.Model):
 
     def __str__(self):
         return f"Bathroom for {self.application.business_name}"
+
+
+class AccessCode(models.Model):
+    """Temporary access codes generated for a collaborator's bathroom/business.
+    Codes are short strings (6 digits) and expire after a short TTL.
+    """
+    application = models.ForeignKey(CollaboratorApplication, on_delete=models.CASCADE, related_name='access_codes')
+    code = models.CharField(max_length=16, db_index=True)
+    # Optional cryptographic token for embedding in QR payloads (stronger than plain code)
+    # store a hash of the token for verification to avoid keeping plaintext tokens in DB
+    token_hash = models.CharField(max_length=128, null=True, blank=True, db_index=True)
+    # If issuance is tied to a specific user (customer), store their id for additional validation
+    user_id = models.BigIntegerField(null=True, blank=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    used = models.BooleanField(default=False)
+    used_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, related_name='used_access_codes', on_delete=models.SET_NULL)
+    used_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Code {self.code} for {self.application.business_name} (used={self.used})"

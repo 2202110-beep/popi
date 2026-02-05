@@ -3,6 +3,7 @@ import Home from './pages/Home.jsx';
 import Register from './pages/Register.jsx';
 import Login from './pages/Login.jsx';
 import Collaborator from './pages/Collaborator.jsx';
+import CollaboratorAccess from './pages/CollaboratorAccess.jsx';
 import Dashboard from './pages/user/Dashboard.jsx';
 import Profile from './pages/user/Profile.jsx';
 import PartnerDashboard from './pages/partner/PartnerDashboard.jsx';
@@ -16,6 +17,7 @@ function App() {
       <Route path="/register" element={<Register />} />
       <Route path="/login" element={<Login />} />
       <Route path="/colaborar" element={<RequireAuth><Collaborator /></RequireAuth>} />
+      <Route path="/colaborar/access" element={<RequireAuth><CollaboratorAccess /></RequireAuth>} />
       <Route path="/app" element={<RequireAuth><Dashboard /></RequireAuth>} />
       <Route path="/profile" element={<RequireAuth><Profile /></RequireAuth>} />
       <Route path="/colaborador/panel" element={<RequireAuth><PartnerDashboard /></RequireAuth>} />

@@ -8,8 +8,12 @@ from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from django.middleware.csrf import get_token
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from django.conf import settings
+from django.db import transaction
+from django.core.cache import cache
 
 from .models import CollaboratorApplication, UserProfile, Bathroom
+from .models import AccessCode
 from .serializers import RegisterSerializer, LoginSerializer, CollaboratorApplicationSerializer, CollaboratorBusinessSerializer, BathroomSerializer
 
 
@@ -225,14 +229,44 @@ class CollaboratorDecisionView(APIView):
                 profile.role = 'collaborator'
                 profile.save(update_fields=['role'])
         else:
-            application.status = CollaboratorApplication.Status.REJECTED
-            application.save(update_fields=['status'])
+            # On rejection, downgrade user role and remove the application so the
+            # business (and its unique `place_id`) can be registered again.
             profile = getattr(application.user, 'profile', None)
             if profile and profile.role != 'customer':
                 profile.role = 'customer'
                 profile.save(update_fields=['role'])
 
-        return Response({'success': True, 'status': application.status})
+            # Remove uploaded documents from storage (best-effort) and delete
+            # the application. Related objects (Bathroom, AccessCode) will be
+            # cascade-deleted by the ORM.
+            try:
+                if getattr(application, 'ine_document', None):
+                    try:
+                        application.ine_document.delete(save=False)
+                    except Exception:
+                        pass
+                if getattr(application, 'address_proof_document', None):
+                    try:
+                        application.address_proof_document.delete(save=False)
+                    except Exception:
+                        pass
+            except Exception:
+                # guard against any attribute/access errors
+                pass
+
+            try:
+                application.delete()
+                status_val = 'deleted'
+            except Exception:
+                # if delete fails for any reason, mark as rejected as a fallback
+                try:
+                    application.status = CollaboratorApplication.Status.REJECTED
+                    application.save(update_fields=['status'])
+                    status_val = application.status
+                except Exception:
+                    status_val = 'error'
+
+        return Response({'success': True, 'status': status_val})
 
 
 def user_payload(user: User) -> dict:
@@ -260,9 +294,10 @@ class PublicPlacesView(APIView):
     permission_classes = []
 
     def get(self, request):
+        # Only include applications that have an active bathroom
         qs = CollaboratorApplication.objects.select_related('user').filter(
             status=getattr(CollaboratorApplication.Status, 'APPROVED', 'approved'),
-            bathroom__isnull=False,
+            bathroom__is_active=True,
         ).order_by('-created_at')
 
         lat_q = request.query_params.get('lat')
@@ -310,6 +345,36 @@ class PublicPlacesView(APIView):
         return Response({'places': results})
 
 
+class PublicPlaceDetailView(APIView):
+    """Return a single approved collaborator place by id.
+    Mirrors the fields returned in PublicPlacesView for consistency.
+    """
+    permission_classes = []
+
+    def get(self, request, pk: int):
+        try:
+            app = CollaboratorApplication.objects.select_related('user').get(pk=pk, status=getattr(CollaboratorApplication.Status, 'APPROVED', 'approved'))
+        except CollaboratorApplication.DoesNotExist:
+            return Response({'detail': 'Lugar no encontrado.'}, status=status.HTTP_404_NOT_FOUND)
+
+        lat = float(app.latitude)
+        lng = float(app.longitude)
+        payload = {
+            'id': app.id,
+            'business_name': app.business_name,
+            'address': app.address,
+            'lat': lat,
+            'lng': lng,
+            'rating': float(app.rating) if app.rating is not None else None,
+            'review_count': app.review_count,
+            'website': app.website,
+            'business_phone': app.business_phone,
+            'place_id': app.place_id,
+            'photo_url': app.photo_url,
+        }
+        return Response({'place': payload})
+
+
 class CollaboratorApplyView(APIView):
     """Allow an authenticated user to submit their business for collaborator review.
     This does NOT create a new user; it links the application to the current user.
@@ -349,7 +414,8 @@ class PartnerApplicationsView(APIView):
                 'lng': float(app.longitude),
                 'status': app.status,
                 'place_id': app.place_id,
-                'has_bathroom': hasattr(app, 'bathroom'),
+                # consider a bathroom present only if it's active
+                'has_bathroom': hasattr(app, 'bathroom') and getattr(getattr(app, 'bathroom', None), 'is_active', False),
             })
         return Response({'applications': payload})
 
@@ -365,10 +431,183 @@ class PartnerCreateBathroomView(APIView):
 
         if app.status != CollaboratorApplication.Status.APPROVED:
             return Response({'detail': 'El negocio debe estar verificado antes de registrar un baño.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        if hasattr(app, 'bathroom'):
+        # If an active bathroom exists, block creation
+        if hasattr(app, 'bathroom') and getattr(app.bathroom, 'is_active', False):
             return Response({'detail': 'Este negocio ya tiene un baño registrado.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # If a bathroom record exists but is inactive (for example previously rejected),
+        # remove it so the partner can register again. This avoids OneToOne conflicts.
+        if hasattr(app, 'bathroom') and not getattr(app.bathroom, 'is_active', False):
+            try:
+                app.bathroom.delete()
+            except Exception:
+                pass
 
         bathroom = Bathroom.objects.create(application=app, is_active=True)
         return Response({'bathroom': BathroomSerializer(bathroom).data}, status=status.HTTP_201_CREATED)
+
+
+class IssueAccessCodeView(APIView):
+    """Issue a temporary access code for a collaborator's application.
+    Body: { application_id: int, ttl_minutes?: int, guest?: true }
+    - If authenticated: only owner or staff may issue codes.
+    - If unauthenticated: guest issuance allowed when `guest` is truthy (used for end-users requesting a code to show the business).
+    """
+    permission_classes = []
+
+    def post(self, request):
+        app_id = request.data.get('application_id')
+        ttl = int(request.data.get('ttl_minutes') or 10)
+        guest = bool(request.data.get('guest') or False)
+        if not app_id:
+            return Response({'detail': 'application_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            app = CollaboratorApplication.objects.get(pk=app_id)
+        except CollaboratorApplication.DoesNotExist:
+            return Response({'detail': 'Solicitud no encontrada.'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Authenticated users: must be owner or staff
+        if request.user and request.user.is_authenticated:
+            if not (request.user.is_staff or app.user_id == request.user.id):
+                return Response({'detail': 'No autorizado.'}, status=status.HTTP_403_FORBIDDEN)
+            creator = request.user
+        else:
+            # Unauthenticated: only allow when explicitly requested as guest issuance
+            if not guest:
+                return Response({'detail': 'Autenticacion requerida.'}, status=status.HTTP_401_UNAUTHORIZED)
+            creator = None
+
+        from django.utils import timezone
+        import random
+        import uuid
+        import hashlib
+        import hmac
+        code = str(random.randint(100000, 999999))
+        token = uuid.uuid4().hex
+        expires_at = timezone.now() + timezone.timedelta(minutes=ttl)
+
+        # Allow optional user id (from authenticated user or client) to be associated with the code
+        supplied_user_id = request.data.get('user_id') or None
+        user_id_val = None
+        try:
+            if request.user and request.user.is_authenticated:
+                user_id_val = request.user.id
+            elif supplied_user_id is not None:
+                user_id_val = int(supplied_user_id)
+        except Exception:
+            user_id_val = None
+
+        # Hash the token before storing. Use HMAC with secret.
+        secret = getattr(settings, 'ACCESS_TOKEN_SECRET', None) or getattr(settings, 'SECRET_KEY')
+        token_hash = hmac.new(key=secret.encode('utf-8'), msg=token.encode('utf-8'), digestmod=hashlib.sha256).hexdigest()
+
+        # Simple rate-limiting / cooldown to avoid abuse: per-IP per-application
+        ip = request.META.get('HTTP_X_FORWARDED_FOR', request.META.get('REMOTE_ADDR', 'unknown')).split(',')[0].strip()
+        cooldown_ttl = 30 if request.user and request.user.is_authenticated else 60
+        cache_key = f'issue_cd:{ip}:{app.id}'
+        if cache.get(cache_key):
+            return Response({'detail': 'Demasiadas solicitudes. Intenta nuevamente en unos segundos.'}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+        cache.set(cache_key, '1', timeout=cooldown_ttl)
+
+        ac = AccessCode.objects.create(
+            application=app,
+            code=code,
+            token_hash=token_hash,
+            user_id=user_id_val,
+            created_by=creator,
+            expires_at=expires_at,
+        )
+
+        # Provide a structured payload that the frontend can directly embed in a QR
+        issued_at = timezone.now().isoformat()
+        payload_obj = {
+            'application_id': app.id,
+            'user_id': user_id_val,
+            'token': token,
+            'code': ac.code,
+            'issued_at': issued_at,
+            'expires_at': ac.expires_at.isoformat() if ac.expires_at else None,
+        }
+        # Also include a compact `text` for older clients (stringified JSON)
+        import json
+        # Return plaintext token to the caller (frontend) so it can be embedded in the QR.
+        return Response({
+            'code': ac.code,
+            'token': token,
+            'expires_at': ac.expires_at,
+            'application_id': app.id,
+            'text': json.dumps(payload_obj),
+            'payload': payload_obj,
+        }, status=status.HTTP_201_CREATED)
+
+
+class VerifyAccessCodeView(APIView):
+    """Verify a code for a given application. Marks it used when valid.
+    Body: { application_id: int, code: str }
+    """
+    permission_classes = []
+
+    def post(self, request):
+        app_id = request.data.get('application_id')
+        code = (request.data.get('code') or '').strip()
+        token = (request.data.get('token') or '').strip()
+        user_id_supplied = request.data.get('user_id')
+        if not app_id or (not code and not token):
+            return Response({'detail': 'application_id and (code or token) are required.'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            app = CollaboratorApplication.objects.get(pk=app_id, status=getattr(CollaboratorApplication.Status, 'APPROVED', 'approved'))
+        except CollaboratorApplication.DoesNotExist:
+            return Response({'detail': 'Lugar no encontrado.'}, status=status.HTTP_404_NOT_FOUND)
+
+        from django.utils import timezone
+        now = timezone.now()
+        # find by token first (preferred), otherwise by code
+        ac = None
+        try:
+            # Prefer token verification using token_hash
+            # Use a transaction and row lock to prevent race conditions marking the same code used
+            with transaction.atomic():
+                if token:
+                    import hashlib, hmac as _hmac
+                    token_h = _hmac.new(key=secret.encode('utf-8'), msg=token.encode('utf-8'), digestmod=hashlib.sha256).hexdigest()
+                    ac = AccessCode.objects.select_for_update().filter(application=app, token_hash=token_h).order_by('-created_at').first()
+                # Fallback: code matching (less secure)
+                if not ac and code:
+                    ac = AccessCode.objects.select_for_update().filter(application=app, code=code).order_by('-created_at').first()
+        except Exception:
+            ac = None
+
+        if not ac:
+            return Response({'ok': False, 'detail': 'Codigo invalido o ya usado.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if ac.used:
+            return Response({'ok': False, 'detail': 'Codigo ya usado.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if ac.expires_at and ac.expires_at < now:
+            return Response({'ok': False, 'detail': 'Codigo expirado.'}, status=status.HTTP_400_BAD_REQUEST)
+        # If the code is tied to a specific user, ensure provided user_id (from QR) matches
+        try:
+            if ac.user_id is not None and user_id_supplied is not None:
+                if str(ac.user_id) != str(user_id_supplied):
+                    return Response({'ok': False, 'detail': 'Usuario no coincide con el pase.'}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception:
+            pass
+
+        # Mark used and record who validated it (if authenticated)
+        with transaction.atomic():
+            # refresh/lock the row again to be safe
+            ac = AccessCode.objects.select_for_update().get(pk=ac.pk)
+            if ac.used:
+                return Response({'ok': False, 'detail': 'Codigo ya usado.'}, status=status.HTTP_400_BAD_REQUEST)
+            ac.used = True
+            if request.user and request.user.is_authenticated:
+                ac.used_by = request.user
+            ac.used_at = now
+            ac.save(update_fields=['used', 'used_by', 'used_at'])
+
+        return Response({'ok': True, 'place': {
+            'id': app.id,
+            'business_name': app.business_name,
+            'address': app.address,
+        }})
 
